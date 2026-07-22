@@ -1,187 +1,181 @@
-# High-Performance Linpack (HPL) Benchmark: Optimisation and Scaling Laws
+# HPL Benchmark Scaling on the Hopper Cluster (UNM CARC)
 
-This project evaluates **High Performance Linpack (HPL) benchmark performance** across multiple HPC clusters at the **University of New Mexico Center for Advanced Research Computing (CARC)**.
+Parameter sweep, output parsing, and scaling analysis for the High Performance
+Linpack (HPL) benchmark, run on the Hopper cluster at the University of New
+Mexico Center for Advanced Research Computing (CARC).
 
-The objective was to identify optimal parameter configurations and analyze **scaling behavior of distributed HPC workloads**.
+This repository is the tooling and results for my individual contribution
+(Hopper) to a three-person HPL benchmarking project across three UNM CARC
+clusters. The full write-up, including the Easley and class cluster sections
+covered by my teammates, is in `HPC_HPL.pdf`.
 
----
+## What HPL measures
 
-# Technologies
+HPL solves a large dense system of linear equations Ax = b using LU
+decomposition with partial pivoting, distributed across MPI ranks. It reports
+the achieved floating point rate in GFLOP/s and is the benchmark used to rank
+systems on the TOP500 list. Its performance depends heavily on three
+parameters:
 
-- MPI
-- HPL Benchmark
-- Slurm Workload Manager
-- Python (data analysis & plotting)
-- Jupyter Notebooks
-- HPC Clusters (CARC)
+- **N**: the matrix size (problem size)
+- **NB**: the block size used to tile the matrix for the distributed
+  factorization
+- **P x Q**: the shape of the MPI process grid, where P * Q equals the total
+  number of MPI ranks
 
----
+## Compute environment
 
-# Clusters Evaluated
+- Cluster: Hopper (UNM CARC)
+- 32 cores per node
+- InfiniBand interconnect
+- Compiler: GCC
+- Scheduler: Slurm
 
-Experiments were executed on the following UNM HPC systems:
+## Methodology
 
-• **Class Cluster**  
-• **Hopper Cluster** – InfiniBand network, 32 cores per node  
-• **Easley Cluster** – Dual Intel Xeon Gold 6438Y+, 64 cores, 251GB RAM
+N was chosen as roughly 80% of the available RAM for a given rank count, to
+maximize problem size without running out of memory. NB was swept over
+64, 96, 128, 160, 192, 224, 256, and 288. Process grid shapes were swept
+across all valid P x Q factorizations of the rank count, from tall (e.g.
+2x16) to square (e.g. 8x8) to wide (e.g. 32x1), to isolate the effect of
+grid shape on communication cost.
 
----
+Two scaling regimes were studied:
 
-# Experimental Methodology
+- **Strong scaling (Amdahl's Law)**: problem size N held fixed while the
+  number of MPI ranks increases. Runtime drops as ranks increase, but gains
+  diminish as the serial fraction and communication overhead start to
+  dominate.
+- **Weak scaling (Gustafson's Law)**: N grows together with the rank count
+  so that the work per rank stays roughly constant. Runtime grows with N,
+  but the achieved GFLOP/s stays stable if communication overhead doesn't
+  grow faster than the added compute.
 
-The benchmark was optimized by exploring different HPL parameters:
+`scripts/submit_sweep.sh` automates submission across node counts from 2 to
+6, generating a separate parameter file and Slurm array for each node count
+since `--nodes` cannot be changed once a job is running.
 
-- Matrix size **N**
-- Block size **NB**
-- MPI process grid **P × Q**
+## Repository layout
 
-Automation was implemented using **Slurm job scripts and parameter sweeps**.
+```
+scripts/
+  HPL_template.dat      HPL.dat template with <N>, <NB>, <P>, <Q> placeholders
+  hpl_sweep.sbatch       Slurm array job, one HPL run per array task
+  aggregate_results.sh   combines per-task result files into one CSV
+  submit_sweep.sh        wrapper that submits one sbatch job per node count (2-6)
+  generate_params.py     generates the parameter CSV (N, NB, P, Q, nodes, ntasks_per_node)
+  parse_results.py       parses HPL .out files into a consolidated CSV
+params/                  generated parameter CSVs (one per node count)
+results/                 per-task result CSVs, raw HPL .out files, consolidated CSVs
+analysis/
+  analyze_scaling.py     speedup, efficiency, and plots
+requirements.txt
+HPC_HPL.pdf              full project report (all three clusters)
+```
 
-The workflow:
+## Running the sweep
 
-1. Generate `HPL.dat` configuration files
-2. Submit jobs through Slurm
-3. Execute HPL runs with `srun xhpl`
-4. Parse output files to extract performance metrics
-5. Analyze results with Python and visualize trends
+1. Generate a parameter file (or let `submit_sweep.sh` do this per node
+   count):
 
----
+   ```
+   python3 scripts/generate_params.py \
+     --n 60992 \
+     --nb 64 96 128 160 192 224 256 288 \
+     --nodes-min 2 --nodes-max 6 \
+     --ntasks-per-node 8 \
+     --output params/HPL_params.csv
+   ```
 
-# Results
+2. Submit the full sweep across node counts 2 to 6:
 
-## Process Grid Optimization
+   ```
+   bash scripts/submit_sweep.sh
+   ```
 
-The shape of the MPI process grid significantly affects performance.
+   Each node count gets its own parameter CSV under `params/` and its own
+   `sbatch --array` job, sized to the number of valid P x Q combinations for
+   that rank count.
 
+3. Once jobs finish, combine the quick per-task GFLOPS files into one CSV:
 
+   ```
+   bash scripts/aggregate_results.sh results results/HPL_results.csv
+   ```
 
-For **N = 60992**, **NB = 128**, and **32 ranks**:
+4. Parse the raw HPL `.out` files (preserved under `results/raw/`) into a
+   consolidated CSV with runtime and GFLOP/s:
 
-| Process Grid | Performance |
-|---------------|-------------|
-| 2×16 | ~209 GFLOP/s |
-| 4×8 | ~960 GFLOP/s |
-| **8×4** | **~1106 GFLOP/s (best)** |
-| 16×2 | ~930 GFLOP/s |
-| 32×1 | ~750 GFLOP/s |
+   ```
+   python3 scripts/parse_results.py --raw-dir results/raw --output results/parsed_results.csv
+   ```
 
-Near-square grids achieve the best communication patterns and significantly outperform elongated grids.
+5. Generate plots:
 
----
+   ```
+   python3 analysis/analyze_scaling.py --input results/parsed_results.csv nb-sweep --n 60992 --p 4 --q 8
+   python3 analysis/analyze_scaling.py --input results/parsed_results.csv grid-shape --n 60992 --nb 128
+   python3 analysis/analyze_scaling.py --input results/parsed_results.csv strong-scaling --n 60992 --nb 160
+   python3 analysis/analyze_scaling.py --input results/parsed_results.csv weak-scaling --p 8 --q 8 --nb 160
+   ```
 
-## Block Size Optimization
+## Results
 
-Performance was evaluated for different **block sizes (NB)**.
-
-
-
-For **N = 60992**, **P×Q = 4×8**:
+### Block size sweep (N=60992, P x Q=4x8, 32 ranks)
 
 | NB | GFLOP/s |
 |----|---------|
 | 64 | ~746 |
-| 96 | ~935 |
-| 128 | ~950 |
-| 160 | ~840 |
+| 96-128 | ~935-950 (peak) |
 | 192 | ~765 |
-| 224 | ~510 |
-| 256 | ~270 |
+| 256-288 | below 300 |
 
-Medium block sizes provide the best balance between communication and computation.
+Medium block sizes give the best balance between computation and
+communication; very large blocks collapse performance.
 
----
+### Process grid shape (N=60992, NB=128, 32 ranks)
 
-## Block Size Optimization for Large Problems
+Grids tested: 2x16, 4x8, 8x4, 16x2, 32x1.
 
+| Grid | GFLOP/s |
+|------|---------|
+| 2x16 | ~209 (worst) |
+| 8x4 | ~1106 (best) |
 
+The near-square 8x4 grid clearly outperforms the elongated 2x16 grid.
 
-For **N = 121984** and **128 ranks (P×Q = 16×8)**:
+### Larger problems
 
-| NB | Performance |
-|----|-------------|
-| 128 | ~2440 GFLOP/s |
-| **160** | **~2680 GFLOP/s (best)** |
-| 192 | ~2670 GFLOP/s |
-| 256 | ~2590 GFLOP/s |
+- N=86242, P x Q=8x8 (64 ranks): best at NB=160, ~1.83 TFLOP/s
+- N=121984, P x Q=16x8 (128 ranks): best at NB=160-192, ~2.67 TFLOP/s
 
-Optimal NB values again lie in the **160–192 range**.
+### Weak scaling (P x Q=8x8, NB=160)
 
----
+N was increased from 86242 to 90000 to 100242. Runtime grew from about
+232-234 s at N=86242 to about 390 s at N=100242, while performance stayed
+stable in the 1.7-1.8 TFLOP/s range across all three points.
 
-## Strong Scaling Results
+As N grows, runtime increases but the achieved GFLOP/s stays stable, in
+line with Gustafson's Law.
 
-Strong scaling experiments were conducted on the Team Cluster with **fixed problem size N = 14616**.
+### Best run per rank count
 
+| Ranks | N | Best performance |
+|-------|-----|-------------------|
+| 32 | 60992 | ~1.11 TFLOP/s |
+| 64 | 86242 | ~1.84 TFLOP/s |
+| 128 | 121984 | ~2.95 TFLOP/s |
 
+Larger problems with more ranks reach higher absolute performance, but only
+with the right NB and grid shape.
 
-| Processes | Runtime (s) | GFLOP/s | Speedup | Efficiency |
-|-----------|-------------|---------|---------|-----------|
-| 4 | 50.30 | 41.39 | 1.00 | 1.00 |
-| 8 | 28.17 | 73.90 | 1.79 | 0.89 |
-| 16 | 17.21 | 120.94 | 2.92 | 0.73 |
-| 24 | 12.47 | 167.01 | 4.03 | 0.67 |
-| 32 | 9.53 | 218.40 | 5.28 | 0.66 |
+## Authors
 
-Runtime decreases as more processes are used, though scaling efficiency gradually decreases due to communication overhead.
+This work is part of a three-person HPL benchmarking project at UNM. The
+Hopper cluster (this repository) was my individual contribution.
 
----
+- **Alfredo Navarrete Montes** (Hopper cluster)
+- Yun Zheng (class cluster)
+- Evelyn Sanchez (Easley cluster)
 
-## Weak Scaling Results
-
-Weak scaling experiments increased matrix size as the number of processors increased.
-
-
-
-Runtime grows gradually as the global matrix size increases.
-
-| N | Runtime |
-|---|--------|
-| 14616 | ~50 s |
-| 20670 | ~77 s |
-| 29232 | ~134 s |
-| 35802 | ~170 s |
-| 41340 | ~202 s |
-
----
-
-
-
-Performance increases with larger matrices:
-
-| N | GFLOP/s |
-|---|--------|
-| 14616 | ~41 |
-| 20670 | ~76 |
-| 29232 | ~124 |
-| 35802 | ~180 |
-| 41340 | ~233 |
-
-This behavior follows **Gustafson's Law**, where larger problems allow better hardware utilization.
-
----
-
-# Key Findings
-
-• **Optimal block size range:** NB ≈ 128–192  
-• **Best process grid:** near-square configurations (8×4, 8×8)  
-• **Peak Easley performance:** **3.45 TFLOPS**  
-• Larger matrices significantly improve computational efficiency.
-
----
-
-# Full Technical Report
-
-The full research report is included in the repo.
-
-
-# Authors
-
-**ALFREDO NAVARRETE MONTES**  
-
-**YUN ZHENG**
-
-**EVELYN SANCHEZ** 
-
-
-
-
+See `HPC_HPL.pdf` for the full report.
